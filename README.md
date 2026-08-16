@@ -99,6 +99,17 @@ UE4SS. `WasRecentlyRendered` alone is not sufficient — it counts shadow-pass
 renders, so an enemy behind a wall casting a shadow into view still reads as
 visible.
 
+Bar maximums are only taken from `UHeldenStatsComponent.TotalStats` where
+`AActor::HasAuthority()` is true. `TotalStats` is computed locally rather than
+replicated — the game replicates a recipe (`ReplicatedStats`: stat names plus
+level) and each machine derives the totals itself — and on a machine that does
+not own the actor that derivation does not produce real numbers; every enemy
+read back a flat 120 maximum on a joining client. `CurrentHealth` does
+replicate. So off the host, the maximum is the highest health the mod has
+observed for that enemy, which is exact for anything seen before it was hurt
+and is also the only source that survives a host-side stat mod raising max
+health (that raised maximum never leaves the host).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

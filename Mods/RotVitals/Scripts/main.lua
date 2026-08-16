@@ -1,5 +1,18 @@
 --[[--------------------------------------------------------------------------
-  RotVitals v1.1  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
+  RotVitals v1.2  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
+
+  v1.2 fixes the bar maximum on clients. UHeldenStatsComponent.TotalStats is
+  computed locally rather than replicated - the game replicates a recipe
+  (ReplicatedStats: stat names + level) and each machine works the totals out
+  for itself - and on a machine that does not own the actor that recompute
+  does not produce real numbers: every enemy read back a flat 120 max on a
+  joining client. CurrentHealth does replicate, which is why only the right
+  hand number was wrong. Maximums now come from the game's totals only where
+  AActor:HasAuthority() is true, and from the highest health actually
+  observed everywhere else. That also fixes a second case the game's own
+  numbers could never have covered: a host running a stat mod like
+  RotScaling raises max health locally, and that raised maximum never
+  reaches clients at all.
 
   A health bar hovers over every enemy's head, tracks them smoothly at frame
   rate, and reads the live replicated health value - so it works as host or
@@ -144,6 +157,7 @@ local S = {
     -- projection self-check
     manualOK = nil,  -- nil = still calibrating, true/false = decided
     calN = 0, calGood = 0, calErr = 0, calDone = false,
+    auth = nil,      -- logged once: do we own the enemies we are drawing?
 }
 
 local W = { widget = nil, canvas = nil, bars = {}, wll = nil }
@@ -715,7 +729,26 @@ local function Classify(entry)
 
     local maxhp = 0
     pcall(function() maxhp = stats.TotalStats.MaxHealth end)
-    if type(maxhp) ~= "number" or maxhp <= 0 then return "retry" end
+    if type(maxhp) ~= "number" then maxhp = 0 end
+
+    local hp0 = 0
+    pcall(function() hp0 = stats.CurrentHealth end)
+    if type(hp0) ~= "number" then hp0 = 0 end
+    if maxhp <= 0 and hp0 <= 0 then return "retry" end
+
+    -- TotalStats is computed locally, not replicated: the game replicates a
+    -- recipe (ReplicatedStats = stat names + level) and each machine works
+    -- the totals out for itself. On a machine that does not own the actor
+    -- that recompute does not produce real numbers - every enemy reported a
+    -- flat 120 max on a joining client (seen in play 2026-08-16). So only
+    -- trust it where we have authority. Everywhere else the highest health
+    -- we have actually observed is the honest maximum: enemies are at full
+    -- when they spawn, and unlike any local recompute it also follows
+    -- host-side stat mods (RotScaling), whose raised maximum never
+    -- replicates at all even though the health values it produces do.
+    local auth = false
+    pcall(function() auth = c:HasAuthority() end)
+    if auth ~= true then auth = false end
 
     -- Bar sits above the capsule; scaled half-height already accounts for the
     -- character's scale. Preset value and a constant back it up.
@@ -739,21 +772,31 @@ local function Classify(entry)
         ench = (n ~= nil and n ~= "" and n ~= "None")
     end)
 
-    local hp = maxhp
-    pcall(function() hp = stats.CurrentHealth end)
-    if type(hp) ~= "number" then hp = maxhp end
+    local hp = hp0
+    local peak = hp
+    if auth and maxhp > peak then peak = maxhp end
+    local shown = peak
+    if auth and maxhp > 0 then shown = maxhp end
+    if shown < hp then shown = hp end
+    if shown <= 0 then shown = 1 end
 
     local e = {
         obj = c, key = entry.key, stats = stats,
         head = half + CFG.HEAD_OFFSET,
-        max = maxhp, hp = hp,
-        frac = Clamp(hp / maxhp, 0, 1),
-        gfrac = Clamp(hp / maxhp, 0, 1),
+        max = shown, hp = hp, peak = peak, auth = auth,
+        frac = Clamp(hp / shown, 0, 1),
+        gfrac = Clamp(hp / shown, 0, 1),
         ghostAt = 0, punch = 0, alpha = 0, scale = 1,
         ench = ench, near = false, dist = 0, sx = 0, sy = 0,
         bar = nil, dead = false,
         los = nil, losAt = 0, losMiss = 0,
     }
+    if S.auth == nil then
+        S.auth = auth
+        Log(auth and "authority: host - enemy maximums come from the game's own stats"
+                  or "authority: client - enemy maximums come from observed peak health "
+                     .. "(the game's totals are not replicated)")
+    end
     S.list[#S.list + 1] = e
     S.byKey[entry.key] = e
     return "done"
@@ -925,12 +968,8 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
     -- health: read straight off the replicated component every frame so the
     -- bar is never a frame behind a hit.
     if not e.dead then
-        local hp, mx = e.hp, e.max
-        pcall(function()
-            hp = e.stats.CurrentHealth
-            mx = e.stats.TotalStats.MaxHealth
-        end)
-        if type(mx) == "number" and mx > 0 then e.max = mx end
+        local hp = e.hp
+        pcall(function() hp = e.stats.CurrentHealth end)
         if type(hp) == "number" then
             if hp < e.hp - 0.01 then
                 e.punch = 1
@@ -939,7 +978,20 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
                 e.gfrac = -1 -- healed: let the ghost snap up with the fill
             end
             e.hp = hp
+            if hp > e.peak then e.peak = hp end
         end
+
+        -- Maximum: the game's own total only where we own the actor, the
+        -- highest health we have seen otherwise. See the note in Classify.
+        local mx
+        if e.auth then
+            pcall(function() mx = e.stats.TotalStats.MaxHealth end)
+            if type(mx) ~= "number" or mx <= 0 then mx = nil end
+        end
+        if mx == nil or mx < e.peak then mx = e.peak end
+        if mx < e.hp then mx = e.hp end   -- never render an over-full bar
+        if mx > 0 then e.max = mx end
+
         if e.hp <= 0 then e.dead = true end
     end
 
@@ -1159,10 +1211,11 @@ local function OnFrame()
     if now >= S.nextStatus then
         S.nextStatus = now + CFG.STATUS_SECS
         Log(string.format("status: %d tracked, %d in range, %d bars up, %d queued, "
-            .. "projection %s, walls %s",
+            .. "projection %s, walls %s, maximums %s",
             #S.list, #S.active, S.shown, #S.queue,
             (S.manualOK == true) and "own+lead" or (S.manualOK == false and "engine" or "calibrating"),
-            CFG.WALL_CHECK and "on" or "off"))
+            CFG.WALL_CHECK and "on" or "off",
+            (S.auth == true) and "game stats" or (S.auth == false and "observed peak" or "unknown")))
     end
 end
 
@@ -1195,6 +1248,7 @@ pcall(function()
         S.nextSweep = 0
         S.nextViewport = 0
         S.memo = {}
+        S.auth = nil   -- may have gone from hosting to joining
     end)
 end)
 
@@ -1203,6 +1257,6 @@ end)
 -- right after a level load (the RackAndRoll boot-freeze lesson).
 S.nextSweep = os.clock() + 3
 
-Log(string.format("loaded v1.1 (%d bars, range %dm, lead %.2f, walls %s)",
+Log(string.format("loaded v1.2 (%d bars, range %dm, lead %.2f, walls %s)",
     CFG.MAX_BARS, math.floor(CFG.MAX_DIST / 100), CFG.CAMERA_LEAD,
     CFG.WALL_CHECK and "on" or "off"))
