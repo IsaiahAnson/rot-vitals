@@ -18,10 +18,12 @@ client, and unmodded lobby mates see nothing.
 - **Line-of-sight gated.** Bars are hidden when the enemy is behind geometry,
   and range is capped at 18 m — deliberately not a wallhack.
 - **HP numbers** above the bar, switchable off.
+- **Flying drones too**, which are not characters and have no health of their
+  own — see below.
 - Distance scaling, distance fade, and fade in/out instead of popping.
 
-Only enemies get bars (`EHeldenCharacterType::Enemy`). Players, soul vessels
-and friendly NPCs are ignored.
+Only enemies get bars (`EHeldenCharacterType::Enemy`, plus all `AHeldenDrone`).
+Players, soul vessels and friendly NPCs are ignored.
 
 ## Install
 
@@ -66,6 +68,8 @@ Everything is in the `CFG` block at the top of `Mods/RotVitals/Scripts/main.lua`
 | `SHOW_NUMBERS` | true    | `42 / 118` above the bar                           |
 | `HIDE_FULL_HP` | false   | Set true to only show enemies you have hurt        |
 | `SEGMENTS`     | 4       | Divider ticks across the track (0 = plain bar)     |
+| `DRONES`       | "host"  | Drone bars: `"host"` health, `"state"` 3-step, `"off"` none |
+| `DRONE_OFFSET` | 55      | Bar height above a drone (drones have no capsule)  |
 | `BAR_W` / `BAR_H` | 128 / 14 | Bar size at reference distance                  |
 | `HEAD_OFFSET`  | 40      | Height above the head                              |
 | `CAMERA_LEAD`  | 1.0     | One-frame camera correction — set 0 to disable     |
@@ -109,6 +113,23 @@ replicate. So off the host, the maximum is the highest health the mod has
 observed for that enemy, which is exact for anything seen before it was hurt
 and is also the only source that survives a host-side stat mod raising max
 health (that raised maximum never leaves the host).
+
+### Flying drones
+
+`AHeldenDrone` derives from `AActor`, not `AHeldenCharacter`, so an intake
+watching `HeldenCharacter` never sees one — drones need their own
+`NotifyOnNewObject` and sweep. They also have no stats component and no hit
+points at all: just `EHedldenDroneHealth {Default, Wounded, Dead}`, whose state
+follows the health of the character flying them (`GetDroneHost`,
+`OnHomeHealthChanged_Auth`, `WoundedThreshold`).
+
+So a drone's bar shows its host character's health, which is continuous, exact,
+and the number that actually decides whether the drone lives. If the host is
+also on screen you will see two bars reading the same values. `DRONES = "state"`
+switches to the drone's own three-step reading with the numbers suppressed —
+inventing values for a 3-state enum would be worse than showing none. Drones
+have no capsule, so their bar height is a fixed offset, and because a drone can
+outlive its host the borrowed stats component is revalidated before every read.
 
 ## License
 

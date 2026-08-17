@@ -1,7 +1,23 @@
 --[[--------------------------------------------------------------------------
-  RotVitals v1.2  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
+  RotVitals 1.0.2  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
 
-  v1.2 fixes the bar maximum on clients. UHeldenStatsComponent.TotalStats is
+  Version numbers here match the released package from 1.0.2 onward. Earlier
+  builds carried their own counter: package 1.0.0 shipped script v1.1, and
+  package 1.0.1 shipped script v1.2.
+
+  A health bar hovers over every enemy's head, tracks them smoothly at frame
+  rate, and reads the live replicated health value - so it works as host or
+  as a joining client, and unmodded lobby mates see nothing.
+
+  1.0.2 adds the flying drones. AHeldenDrone derives from AActor, not
+  AHeldenCharacter, so the NotifyOnNewObject/FindAllOf intake never saw them
+  and they had no bars at all. They also carry no health of their own - just a
+  Default/Wounded/Dead state that follows the health of the character flying
+  them - so their bar shows that host's real health by default (CFG.DRONES).
+  Intake give-ups are now logged, so "enemy X never gets a bar" is answerable
+  from UE4SS.log rather than by guesswork.
+
+  1.0.1 fixed the bar maximum on clients. UHeldenStatsComponent.TotalStats is
   computed locally rather than replicated - the game replicates a recipe
   (ReplicatedStats: stat names + level) and each machine works the totals out
   for itself - and on a machine that does not own the actor that recompute
@@ -14,23 +30,19 @@
   RotScaling raises max health locally, and that raised maximum never
   reaches clients at all.
 
-  A health bar hovers over every enemy's head, tracks them smoothly at frame
-  rate, and reads the live replicated health value - so it works as host or
-  as a joining client, and unmodded lobby mates see nothing.
-
-  v1.1 changes
+  1.0.0 shipped with
     * BORDER: drop shadow + hard black outline + bone rim (gold when enchanted)
     * JITTER FIX: the bar is now placed by our own projection maths using a
       one-frame-ahead camera. The anim-BP hook runs before the camera manager
-      updates, so the engine projection we used in v1.0 placed bars with last
+      updates, so the engine projection originally used placed bars with last
       frame's camera - the error is proportional to how fast the camera is
       moving, which is exactly the "bars jump when I move around an enemy"
       symptom. The maths is checked against the engine's own projection for
       the first 20 samples and only used if it agrees; otherwise it falls
-      back to v1.0 behaviour. Set CAMERA_LEAD = 0 to disable the correction.
+      back to the engine projection. Set CAMERA_LEAD = 0 to disable the correction.
     * WALLS: real line-of-sight test (AController::LineOfSightTo - a bool
-      return, no FHitResult out-param, so none of the crash shapes). v1.0
-      relied on WasRecentlyRendered, which also counts shadow-only renders,
+      return, no FHitResult out-param, so none of the crash shapes). The
+      first cut relied on WasRecentlyRendered, which also counts shadow-only renders,
       so enemies behind walls stayed "visible".
     * range cut from 38 m to 18 m.
 
@@ -78,6 +90,19 @@ local CFG = {
     REF_DIST      = 800,    -- distance where scale is exactly 1.0
     MIN_SCALE     = 0.70,   -- below ~0.7 the 1 px rim starts to shimmer
     MAX_SCALE     = 1.15,
+
+    -- Flying drones -----------------------------------------------------------
+    -- AHeldenDrone is an AActor, not a character, and carries no health of its
+    -- own - only a Default/Wounded/Dead state that follows the health of the
+    -- host character that flies it (OnHomeHealthChanged_Auth + WoundedThreshold).
+    --   "host"  - show that host's real health. Continuous and exact, and it is
+    --             what actually decides whether the drone lives. If the host is
+    --             also on screen you will see two bars reading the same numbers.
+    --   "state" - show the drone's own 3-step state instead, no numbers.
+    --   "off"   - no bars on drones.
+    DRONES        = "host",
+    DRONE_OFFSET  = 55,     -- uu above the drone's origin (it has no capsule)
+    DRONE_WOUNDED = 0.40,   -- bar fraction shown for Wounded in "state" mode
 
     -- Behaviour -------------------------------------------------------------
     SHOW_NUMBERS  = true,   -- "42 / 118" above the bar
@@ -158,6 +183,7 @@ local S = {
     manualOK = nil,  -- nil = still calibrating, true/false = decided
     calN = 0, calGood = 0, calErr = 0, calDone = false,
     auth = nil,      -- logged once: do we own the enemies we are drawing?
+    gaveUp = 0,      -- capped log of intake give-ups, for diagnosing gaps
 }
 
 local W = { widget = nil, canvas = nil, bars = {}, wll = nil }
@@ -362,7 +388,7 @@ local function ProjectManual(wx, wy, wz, raw)
     return S.vw * 0.5 + CAM.focal * xr / z, S.vh * 0.5 - CAM.focal * yu / z
 end
 
--- ------------------------------------------------- engine projection (v1.0)
+-- ------------------------------------------------- engine projection (fallback)
 
 -- UE4SS out-parameter conventions vary (the value can land in the first table
 -- passed, in the out table, or in an extra return). Resolve which one this
@@ -675,16 +701,25 @@ local function DrawBar(bar, e)
     end
 
     if bar.text and S.textOK then
-        local label = string.format("%d / %d", math.floor(e.hp + 0.5), math.floor(e.max + 0.5))
-        if label ~= bar.label then
-            bar.label = label
-            local ok = pcall(function()
-                bar.text:SetText(FText(label))
-                bar.text:SetVisibility(3)
-            end)
-            if not ok then
-                S.textOK = false
-                Log("HP numbers disabled (SetText failed)")
+        if e.noNumbers then
+            -- a 3-step state bar has no real numbers behind it; inventing
+            -- some would be worse than showing none
+            if bar.label ~= false then
+                bar.label = false
+                pcall(function() bar.text:SetVisibility(1) end)
+            end
+        else
+            local label = string.format("%d / %d", math.floor(e.hp + 0.5), math.floor(e.max + 0.5))
+            if label ~= bar.label then
+                bar.label = label
+                local ok = pcall(function()
+                    bar.text:SetText(FText(label))
+                    bar.text:SetVisibility(3)
+                end)
+                if not ok then
+                    S.textOK = false
+                    Log("HP numbers disabled (SetText failed)")
+                end
             end
         end
     end
@@ -692,15 +727,94 @@ end
 
 -- -------------------------------------------------------------- enemy intake
 
-local function Enqueue(obj)
+local function Enqueue(obj, kind)
     if obj == nil then return false end
     local valid = false
     pcall(function() valid = obj:IsValid() end)
     if not valid then return false end
     local key = KeyOf(obj)
     if not key or S.memo[key] or S.byKey[key] then return false end
-    S.queue[#S.queue + 1] = { obj = obj, key = key, readyAt = os.clock() + CFG.SETTLE_SECS, tries = 0 }
+    S.queue[#S.queue + 1] = {
+        obj = obj, key = key, kind = kind or "char",
+        readyAt = os.clock() + CFG.SETTLE_SECS, tries = 0,
+    }
     return true
+end
+
+-- Reads the drone's own Default(0)/Wounded(1)/Dead(2) state.
+local function DroneState(d)
+    local s
+    pcall(function()
+        s = d.DroneHealth
+        if type(s) ~= "number" then s = tonumber(tostring(s)) end
+    end)
+    if type(s) ~= "number" then return nil end
+    return s
+end
+
+-- Flying drones. Not characters: no stats component, no hit points, and no
+-- CharacterType to filter on - every AHeldenDrone is hostile. Health comes
+-- from the character flying it, which is what its own state tracks anyway.
+local function ClassifyDrone(entry)
+    local d = entry.obj
+    if not (d and d:IsValid()) then return "skip" end
+    if CFG.DRONES == "off" then return "skip" end
+
+    local state = DroneState(d)
+    if state == 2 then return "skip" end   -- already dead
+
+    local stats, auth, hp, peak, shown, noNumbers = nil, false, 1, 1, 1, false
+
+    if CFG.DRONES == "host" then
+        local host
+        pcall(function() host = d:GetDroneHost() end)
+        if not (host and host:IsValid()) then
+            -- the host can stream in after its drone; keep trying, and fall
+            -- back to the state bar rather than never drawing anything
+            if entry.tries < CFG.MAX_TRIES - 1 then return "retry" end
+        else
+            pcall(function() stats = host.CharacterStats end)
+            if stats and not stats:IsValid() then stats = nil end
+            if stats then
+                pcall(function() auth = host:HasAuthority() end)
+                if auth ~= true then auth = false end
+                local mx = 0
+                pcall(function() mx = stats.TotalStats.MaxHealth end)
+                if type(mx) ~= "number" then mx = 0 end
+                hp = 0
+                pcall(function() hp = stats.CurrentHealth end)
+                if type(hp) ~= "number" then hp = 0 end
+                if mx <= 0 and hp <= 0 then return "retry" end
+                peak = hp
+                if auth and mx > peak then peak = mx end
+                shown = (auth and mx > 0) and mx or peak
+                if shown < hp then shown = hp end
+                if shown <= 0 then shown = 1 end
+            end
+        end
+    end
+
+    if stats == nil then
+        -- state bar: a 3-step reading, so the numbers would be invented
+        noNumbers = true
+        hp = (state == 1) and CFG.DRONE_WOUNDED or 1
+        peak, shown = 1, 1
+    end
+
+    local e = {
+        obj = d, key = entry.key, kind = "drone", stats = stats,
+        head = CFG.DRONE_OFFSET,
+        max = shown, hp = hp, peak = peak, auth = auth,
+        frac = Clamp(hp / shown, 0, 1),
+        gfrac = Clamp(hp / shown, 0, 1),
+        ghostAt = 0, punch = 0, alpha = 0, scale = 1,
+        ench = false, near = false, dist = 0, sx = 0, sy = 0,
+        bar = nil, dead = false, noNumbers = noNumbers,
+        los = nil, losAt = 0, losMiss = 0,
+    }
+    S.list[#S.list + 1] = e
+    S.byKey[entry.key] = e
+    return "done"
 end
 
 -- "done" | "skip" | "retry"
@@ -807,7 +921,8 @@ local function DrainQueue(now)
     while budget > 0 and #S.queue > 0 and S.queue[1].readyAt <= now do
         budget = budget - 1
         local entry = table.remove(S.queue, 1)
-        local ok, verdict = pcall(Classify, entry)
+        local fn = (entry.kind == "drone") and ClassifyDrone or Classify
+        local ok, verdict = pcall(fn, entry)
         if not ok then
             S.errCount = S.errCount + 1
             S.memo[entry.key] = true
@@ -818,7 +933,16 @@ local function DrainQueue(now)
                 entry.readyAt = now + CFG.SETTLE_SECS
                 S.queue[#S.queue + 1] = entry
             else
+                -- say why, so "enemy X never gets a bar" is answerable
+                -- from the log instead of by guesswork
                 S.memo[entry.key] = true
+                if S.gaveUp < 12 then
+                    S.gaveUp = S.gaveUp + 1
+                    local cls = "?"
+                    pcall(function() cls = entry.obj:GetClass():GetFName():ToString() end)
+                    Log(string.format("gave up on %s (%s, %s) after %d tries",
+                        entry.key or "?", cls, entry.kind, entry.tries))
+                end
             end
         else
             S.memo[entry.key] = true
@@ -827,19 +951,34 @@ local function DrainQueue(now)
 end
 
 local function Sweep()
-    local n = 0
+    local n, dn = 0, 0
     pcall(function()
         local chars = FindAllOf("HeldenCharacter")
         if not chars then return end
         for _, c in ipairs(chars) do
-            if Enqueue(c) then n = n + 1 end
+            if Enqueue(c, "char") then n = n + 1 end
         end
     end)
-    if n > 0 then Log("sweep queued " .. n .. " character(s)") end
+    -- drones are AActors, not characters, so they need their own sweep
+    if CFG.DRONES ~= "off" then
+        pcall(function()
+            local drones = FindAllOf("HeldenDrone")
+            if not drones then return end
+            for _, d in ipairs(drones) do
+                if Enqueue(d, "drone") then dn = dn + 1 end
+            end
+        end)
+    end
+    if n + dn > 0 then
+        Log(string.format("sweep queued %d character(s), %d drone(s)", n, dn))
+    end
 end
 
 pcall(function()
-    NotifyOnNewObject("/Script/Helden.HeldenCharacter", function(c) Enqueue(c) end)
+    NotifyOnNewObject("/Script/Helden.HeldenCharacter", function(c) Enqueue(c, "char") end)
+end)
+pcall(function()
+    NotifyOnNewObject("/Script/Helden.HeldenDrone", function(d) Enqueue(d, "drone") end)
 end)
 
 -- --------------------------------------------------------------- range pass
@@ -861,13 +1000,17 @@ local function RangePass(cx, cy, cz)
         local alive = false
         pcall(function() alive = e.obj:IsValid() end)
         if alive and CFG.HIDE_DEAD then
-            -- enum reads have come back as non-numbers before; normalise, and
-            -- fall through to the hp <= 0 check if this yields nothing
-            pcall(function()
-                local cs = e.obj.CharacterState
-                if type(cs) ~= "number" then cs = tonumber(tostring(cs)) end
-                if cs == 1 then alive = false end
-            end)
+            if e.kind == "drone" then
+                if DroneState(e.obj) == 2 then alive = false end
+            else
+                -- enum reads have come back as non-numbers before; normalise,
+                -- and fall through to the hp <= 0 check if this yields nothing
+                pcall(function()
+                    local cs = e.obj.CharacterState
+                    if type(cs) ~= "number" then cs = tonumber(tostring(cs)) end
+                    if cs == 1 then alive = false end
+                end)
+            end
         end
 
         if not alive then
@@ -969,7 +1112,23 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
     -- bar is never a frame behind a hit.
     if not e.dead then
         local hp = e.hp
-        pcall(function() hp = e.stats.CurrentHealth end)
+        -- A drone's stats belong to its host, not to the actor we validated
+        -- above, so the host can die out from under it. Drop to the state bar
+        -- rather than reading through a stale component.
+        if e.stats and e.kind == "drone" then
+            local sv = false
+            pcall(function() sv = e.stats:IsValid() end)
+            if not sv then e.stats = nil e.noNumbers = true e.peak = 1 e.max = 1 end
+        end
+        if e.stats then
+            pcall(function() hp = e.stats.CurrentHealth end)
+        else
+            -- state-bar drone: no numbers to read, just the 3-step state
+            local st = DroneState(e.obj)
+            if st == 2 then e.dead = true
+            elseif st == 1 then hp = CFG.DRONE_WOUNDED
+            elseif st == 0 then hp = 1 end
+        end
         if type(hp) == "number" then
             if hp < e.hp - 0.01 then
                 e.punch = 1
@@ -1020,7 +1179,7 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
 
     -- then the real wall test. WasRecentlyRendered alone is not enough: an
     -- enemy behind a wall still counts as rendered if it casts a shadow into
-    -- view, which is why v1.0 showed bars through walls.
+    -- view, which is why the first cut showed bars through walls.
     if want and CFG.WALL_CHECK then
         if now >= e.losAt then
             e.losAt = now + CFG.LOS_INTERVAL * (0.75 + 0.5 * math.random())
@@ -1210,9 +1369,11 @@ local function OnFrame()
 
     if now >= S.nextStatus then
         S.nextStatus = now + CFG.STATUS_SECS
-        Log(string.format("status: %d tracked, %d in range, %d bars up, %d queued, "
+        local nd = 0
+        for _, e in ipairs(S.list) do if e.kind == "drone" then nd = nd + 1 end end
+        Log(string.format("status: %d tracked (%d drones), %d in range, %d bars up, %d queued, "
             .. "projection %s, walls %s, maximums %s",
-            #S.list, #S.active, S.shown, #S.queue,
+            #S.list, nd, #S.active, S.shown, #S.queue,
             (S.manualOK == true) and "own+lead" or (S.manualOK == false and "engine" or "calibrating"),
             CFG.WALL_CHECK and "on" or "off",
             (S.auth == true) and "game stats" or (S.auth == false and "observed peak" or "unknown")))
@@ -1257,6 +1418,6 @@ end)
 -- right after a level load (the RackAndRoll boot-freeze lesson).
 S.nextSweep = os.clock() + 3
 
-Log(string.format("loaded v1.2 (%d bars, range %dm, lead %.2f, walls %s)",
+Log(string.format("loaded 1.0.2 (%d bars, range %dm, lead %.2f, walls %s)",
     CFG.MAX_BARS, math.floor(CFG.MAX_DIST / 100), CFG.CAMERA_LEAD,
     CFG.WALL_CHECK and "on" or "off"))
