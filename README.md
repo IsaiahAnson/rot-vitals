@@ -64,7 +64,9 @@ Everything is in the `CFG` block at the top of `Mods/RotVitals/Scripts/main.lua`
 | `FADE_DIST`    | 1300    | Bars start fading out here                         |
 | `MAX_BARS`     | 16      | Most bars on screen at once (nearest enemies win)  |
 | `WALL_CHECK`   | true    | Hide bars for enemies behind geometry              |
-| `LOS_INTERVAL` | 0.12    | Seconds between line-of-sight traces per enemy     |
+| `LOS_INTERVAL` | 0.09    | Seconds between line-of-sight traces per enemy     |
+| `LOS_HITS`     | 2       | Consecutive clear traces before a bar appears      |
+| `LOS_MISSES`   | 1       | Failed traces before a bar is hidden (1 = instant) |
 | `SHOW_NUMBERS` | true    | `42 / 118` above the bar                           |
 | `HIDE_FULL_HP` | false   | Set true to only show enemies you have hurt        |
 | `SEGMENTS`     | 4       | Divider ticks across the track (0 = plain bar)     |
@@ -102,6 +104,16 @@ Wall occlusion uses `AController::LineOfSightTo` rather than a trace with an
 UE4SS. `WasRecentlyRendered` alone is not sufficient — it counts shadow-pass
 renders, so an enemy behind a wall casting a shadow into view still reads as
 visible.
+
+Because the trace is throttled rather than run every frame, its state machine
+is deliberately biased toward hiding, and every part of that bias was a bug at
+some point. "Not yet traced" counts as hidden, not visible. State expires after
+`LOS_STALE` so an enemy last seen in the open does not return still flagged
+visible. Losing sight applies on the first failed trace, while *gaining* it
+needs `LOS_HITS` in a row — `LineOfSightTo` probes the target's head and capsule
+edges as well as its centre, so a single sample can succeed on a sliver round a
+corner. Putting the hysteresis on the reveal rather than the hide means ties
+resolve to hidden and boundaries settle instead of flickering.
 
 Bar maximums are only taken from `UHeldenStatsComponent.TotalStats` where
 `AActor::HasAuthority()` is true. `TotalStats` is computed locally rather than

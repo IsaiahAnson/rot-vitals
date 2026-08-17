@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------------
-  RotVitals 1.0.2  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
+  RotVitals 1.0.3  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
 
   Version numbers here match the released package from 1.0.2 onward. Earlier
   builds carried their own counter: package 1.0.0 shipped script v1.1, and
@@ -8,6 +8,23 @@
   A health bar hovers over every enemy's head, tracks them smoothly at frame
   rate, and reads the live replicated health value - so it works as host or
   as a joining client, and unmodded lobby mates see nothing.
+
+  1.0.3 stops bars flashing through walls. Three separate ways a throttled
+  line-of-sight check leaked, all of them the same mistake - letting the
+  permissive state win when the answer was not actually known:
+    * "not traced yet" counted as visible, because the gate only hid a bar
+      once a trace had PROVEN no line of sight. Unknown now counts as hidden;
+      nothing goes up until a trace actually succeeds.
+    * an enemy last traced while visible came back still flagged visible after
+      leaving range or the screen. LOS state now expires after LOS_STALE.
+    * a bar already showing survived until TWO traces failed, so stepping
+      behind cover left it up for a fifth of a second on the wrong side of the
+      wall. Losing sight is now instant, and it is GAINING sight that needs
+      consecutive confirmations (LOS_HITS) - LineOfSightTo probes the target's
+      head and capsule edges as well as its centre, so one sample can succeed
+      on a sliver round a corner. Ties resolve to hidden, boundaries settle
+      instead of flickering, and cover hides a bar with a faster fade
+      (FADE_OUT_LOS) so it does not trail into the wall behind you.
 
   1.0.2 adds the flying drones. AHeldenDrone derives from AActor, not
   AHeldenCharacter, so the NotifyOnNewObject/FindAllOf intake never saw them
@@ -75,8 +92,18 @@ local CFG = {
 
     -- Line of sight ---------------------------------------------------------
     WALL_CHECK    = true,   -- hide bars for enemies behind geometry
-    LOS_INTERVAL  = 0.12,   -- s between traces per enemy (staggered)
-    LOS_MISSES    = 2,      -- consecutive failed traces before hiding
+    LOS_INTERVAL  = 0.09,   -- s between traces per enemy (staggered)
+    -- The asymmetry here matters and it is deliberately biased toward hiding.
+    -- Losing sight takes effect on the FIRST failed trace, because a bar that
+    -- lingers after you step behind cover is a bar visible through a wall.
+    -- Gaining sight needs LOS_HITS traces in a row, so a marginal peek round a
+    -- corner - LineOfSightTo also probes the target's head and capsule edges,
+    -- so a single sample can succeed on a sliver - does not put a bar up. Ties
+    -- resolve to hidden, and boundaries settle instead of flickering.
+    LOS_MISSES    = 1,
+    LOS_HITS      = 2,
+    LOS_STALE     = 0.5,    -- s: after this long without a trace, an enemy has
+                            -- to prove line of sight again from scratch
     RENDER_CHECK  = true,   -- also require the enemy to be rendered at all
 
     -- Placement / size ------------------------------------------------------
@@ -128,6 +155,8 @@ local CFG = {
     PUNCH_AMOUNT  = 0.16,   -- extra scale at the peak of the punch
     FADE_IN       = 0.10,
     FADE_OUT      = 0.20,
+    FADE_OUT_LOS  = 0.07,   -- snappier fade when cover is what hid it, so the
+                            -- bar does not trail behind you into the wall
 
     -- Pacing ----------------------------------------------------------------
     RANGE_SECS    = 0.15,   -- distance / liveness pass
@@ -810,7 +839,7 @@ local function ClassifyDrone(entry)
         ghostAt = 0, punch = 0, alpha = 0, scale = 1,
         ench = false, near = false, dist = 0, sx = 0, sy = 0,
         bar = nil, dead = false, noNumbers = noNumbers,
-        los = nil, losAt = 0, losMiss = 0,
+        los = nil, losAt = 0, losMiss = 0, losHit = 0, losRunAt = 0,
     }
     S.list[#S.list + 1] = e
     S.byKey[entry.key] = e
@@ -903,7 +932,7 @@ local function Classify(entry)
         ghostAt = 0, punch = 0, alpha = 0, scale = 1,
         ench = ench, near = false, dist = 0, sx = 0, sy = 0,
         bar = nil, dead = false,
-        los = nil, losAt = 0, losMiss = 0,
+        los = nil, losAt = 0, losMiss = 0, losHit = 0, losRunAt = 0,
     }
     if S.auth == nil then
         S.auth = auth
@@ -1168,6 +1197,7 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
 
     -- should the bar be up at all?
     local want = not e.dead and e.dist <= CFG.MAX_DIST and depth > 5
+    local losBlocked = false
     if want and CFG.HIDE_FULL_HP and e.frac >= 0.999 then want = false end
 
     -- cheap first: is it being rendered at all (frustum / distance culling)
@@ -1181,8 +1211,17 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
     -- enemy behind a wall still counts as rendered if it casts a shadow into
     -- view, which is why the first cut showed bars through walls.
     if want and CFG.WALL_CHECK then
+        -- An enemy we have not traced recently has to prove line of sight
+        -- again. Without this, one that was visible before it went out of
+        -- range (or off screen) comes back still flagged visible and flashes
+        -- a bar through the wall until the misses add up.
+        if now - e.losRunAt > CFG.LOS_STALE then
+            e.los = nil
+            e.losMiss, e.losHit = 0, 0
+        end
         if now >= e.losAt then
             e.losAt = now + CFG.LOS_INTERVAL * (0.75 + 0.5 * math.random())
+            e.losRunAt = now
             local seen, ok = true, false
             ok = pcall(function()
                 seen = pc:LineOfSightTo(e.obj, { X = cx, Y = cy, Z = cz }, false)
@@ -1191,14 +1230,21 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
                 CFG.WALL_CHECK = false
                 Log("LineOfSightTo unavailable - wall check disabled")
             elseif seen == false then
+                e.losHit = 0
                 e.losMiss = e.losMiss + 1
                 if e.losMiss >= CFG.LOS_MISSES then e.los = false end
             else
                 e.losMiss = 0
-                e.los = true   -- coming into view is instant, hiding needs 2
+                e.losHit = e.losHit + 1
+                if e.losHit >= CFG.LOS_HITS then e.los = true end
             end
         end
-        if e.los == false then want = false end
+        -- Unknown counts as hidden. Only a confirmed run of successful traces
+        -- puts a bar up, and a single failure takes it straight back down.
+        if e.los ~= true then
+            want = false
+            losBlocked = true
+        end
     end
 
     local sx, sy
@@ -1234,7 +1280,8 @@ local function UpdateEnemy(e, pc, dt, now, cx, cy, cz)
         if e.alpha + rate < a then e.alpha = e.alpha + rate else e.alpha = a end
         if not e.dead then Calibrate(pc, e) end
     else
-        e.alpha = e.alpha - dt / CFG.FADE_OUT
+        local fade = losBlocked and CFG.FADE_OUT_LOS or CFG.FADE_OUT
+        e.alpha = e.alpha - dt / fade
         if e.alpha < 0 then e.alpha = 0 end
     end
     e.wantBar = (e.alpha > 0.01)
@@ -1418,6 +1465,6 @@ end)
 -- right after a level load (the RackAndRoll boot-freeze lesson).
 S.nextSweep = os.clock() + 3
 
-Log(string.format("loaded 1.0.2 (%d bars, range %dm, lead %.2f, walls %s)",
+Log(string.format("loaded 1.0.3 (%d bars, range %dm, lead %.2f, walls %s)",
     CFG.MAX_BARS, math.floor(CFG.MAX_DIST / 100), CFG.CAMERA_LEAD,
     CFG.WALL_CHECK and "on" or "off"))
