@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------------
-  RotVitals 1.0.3  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
+  RotVitals 1.0.4  -  floating enemy health bars for Grain Rot (UE 5.7 / UE4SS)
 
   Version numbers here match the released package from 1.0.2 onward. Earlier
   builds carried their own counter: package 1.0.0 shipped script v1.1, and
@@ -1465,6 +1465,6 @@ end)
 -- right after a level load (the RackAndRoll boot-freeze lesson).
 S.nextSweep = os.clock() + 3
 
-Log(string.format("loaded 1.0.3 (%d bars, range %dm, lead %.2f, walls %s)",
+Log(string.format("loaded 1.0.4 (%d bars, range %dm, lead %.2f, walls %s)",
     CFG.MAX_BARS, math.floor(CFG.MAX_DIST / 100), CFG.CAMERA_LEAD,
     CFG.WALL_CHECK and "on" or "off"))
