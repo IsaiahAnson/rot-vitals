@@ -1,4 +1,8 @@
+<img src="icon.png" width="128" align="right" alt="RotVitals icon">
+
 # RotVitals
+
+[**Get it on Thunderstore**](https://thunderstore.io/c/grain-rot/p/Mentalize/RotVitals/)
 
 Floating enemy health bars for **Grain Rot** (UE 5.7, via UE4SS).
 
